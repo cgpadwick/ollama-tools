@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
 
 # Vendored llama.cpp binaries fetched by install-llama-tools.sh
 tools/

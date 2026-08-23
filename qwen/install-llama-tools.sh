@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Download prebuilt llama.cpp binaries (for llama-gguf-split) into ./tools.
 # Only needed to merge split GGUF builds such as BF16.
+# Set GITHUB_TOKEN to raise the unauthenticated GitHub API rate limit (60 req/hr).
 set -euo pipefail
 
 REPO="ggml-org/llama.cpp"
@@ -17,9 +18,14 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     exit 1
 fi
 
+AUTH=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+
 echo "==> finding latest llama.cpp release with an ubuntu-${ASSET_ARCH} build"
 read -r TAG URL < <(
-    curl -sfL "https://api.github.com/repos/${REPO}/releases?per_page=10" |
+    curl -sfL "${AUTH[@]}" "https://api.github.com/repos/${REPO}/releases?per_page=10" |
     python3 -c "
 import json, sys
 arch = '${ASSET_ARCH}'
@@ -31,7 +37,14 @@ for rel in json.load(sys.stdin):
             sys.exit(0)
 sys.exit('no matching release asset found')
 "
-)
+) || { echo "could not determine latest release (rate limited? offline?)" >&2; exit 1; }
+
+# Release archives extract to a single top-level dir "llama-<tag>/", e.g. llama-b10599/.
+BUILD_DIR="$DEST/llama-$TAG"
+if [[ -x "$BUILD_DIR/llama-gguf-split" ]]; then
+    echo "==> $TAG already installed at $BUILD_DIR; nothing to do"
+    exit 0
+fi
 
 echo "==> downloading ${TAG}"
 mkdir -p "$DEST"
@@ -40,10 +53,18 @@ trap 'rm -rf "$tmp"' EXIT
 curl -fL --progress-bar -o "$tmp/llama.tar.gz" "$URL"
 tar xzf "$tmp/llama.tar.gz" -C "$DEST"
 
-BIN="$(find "$DEST" -name llama-gguf-split -type f | sort -r | head -1)"
-[[ -n "$BIN" ]] || { echo "llama-gguf-split missing from archive" >&2; exit 1; }
+BIN="$BUILD_DIR/llama-gguf-split"
+[[ -f "$BIN" ]] || { echo "llama-gguf-split missing from archive (expected $BIN)" >&2; exit 1; }
 chmod +x "$BIN"
 
+# Remove older vendored builds so only the one we just verified remains.
+find "$DEST" -mindepth 1 -maxdepth 1 -type d -name 'llama-b*' ! -name "llama-$TAG" -exec rm -rf {} +
+
 echo "==> installed: $BIN"
-"$BIN" --help >/dev/null 2>&1 && echo "==> verified working"
+if ! "$BIN" --help >/dev/null 2>&1; then
+    echo "error: $BIN does not run (missing shared libraries?). Output:" >&2
+    "$BIN" --help 2>&1 | head -5 >&2 || true
+    exit 1
+fi
+echo "==> verified working"
 echo "qwen38-27b-ollama.py will now find it automatically."

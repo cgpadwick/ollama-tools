@@ -51,15 +51,32 @@ ollama run qwen3.8-27b:ud-q4_k_m
 
 Set `HF_WORKERS` to change download parallelism (default 4).
 
+### Tests
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
 ## Notes
 
 - The model is multimodal, so `mmproj-F16.gguf` is fetched by default and added as a
   second `FROM` line in the generated `Modelfile`.
-- Sampling defaults in the `Modelfile` follow Unsloth's recommendations for Qwen3.
+- Sampling defaults in the `Modelfile` follow Unsloth's recommendations for Qwen3 in
+  non-thinking mode (`temperature 0.7`, `top_p 0.8`); for thinking mode Unsloth suggests
+  `temperature 0.6`, `top_p 0.95`. Edit the generated `Modelfile` and re-run
+  `ollama create` to change them, or `num_ctx` (default 8192, a memory tradeoff).
 - Merging BF16 requires `llama-gguf-split` (see `install-llama-tools.sh`). If the merged
-  file already exists, the tool is not needed. The merged file is ~96 bytes larger than a
-  natively-unsplit one because llama.cpp leaves `split.*` metadata keys behind with
-  `split.count = 0`; tensor data is identical and loaders ignore them.
+  file already exists, the tool is not needed and the shards are not re-downloaded, so
+  you can delete them after a successful merge. The merge writes to a `.part` file and
+  renames it on success; an interrupted merge is cleaned up and redone next run. The
+  merged file is ~96 bytes larger than a natively-unsplit one because llama.cpp leaves
+  `split.*` metadata keys behind with `split.count = 0`; tensor data is identical and
+  loaders ignore them.
+- `install-llama-tools.sh` is idempotent and keeps only the newest vendored build. Set
+  `GITHUB_TOKEN` if you hit the unauthenticated GitHub API rate limit.
+- The `mmproj-*.gguf` projector is discovered from the repo listing (F16 preferred); if
+  none exists the script stops and asks for `--no-mmproj`.
 - If `~/.cache/huggingface` is not writable, the script automatically falls back to
   `~/.cache/huggingface-local`.
 - BF16 is ~54 GB across both shards, and merging needs roughly that much *additional*
