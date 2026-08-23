@@ -38,6 +38,27 @@ This drops prebuilt llama.cpp binaries into `tools/`, which the script finds aut
 The installer is idempotent and keeps only the newest build. Set `GITHUB_TOKEN` if you hit
 the unauthenticated GitHub API rate limit.
 
+### Updating Ollama
+
+Ollama only understands model architectures it has been taught. Newly released families
+(e.g. Qwen3.8) and the multi-`FROM` Modelfile used for vision projectors need a recent
+Ollama, otherwise `ollama create` fails with something like
+`Error: unsupported architecture` or `unknown model architecture`. Check and upgrade
+before importing:
+
+```bash
+ollama --version
+```
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh      # Linux: re-running the installer upgrades in place
+```
+
+On macOS/Windows use the app's built-in updater or grab the latest build from
+[ollama.com/download](https://ollama.com/download). Restart the Ollama server after
+upgrading (`systemctl restart ollama` on Linux if installed as a service), then re-run the
+import — the downloaded GGUFs are untouched and will not be fetched again.
+
 ### Do I need `HF_TOKEN`?
 
 **No, for public repos** — everything under `unsloth/*` and `bartowski/*` downloads

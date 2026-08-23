@@ -13,7 +13,9 @@ Utilities for getting models into [Ollama](https://ollama.com).
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) for Python environments
-- [Ollama](https://ollama.com) on your `PATH`
+- [Ollama](https://ollama.com) on your `PATH` — keep it **up to date**; new model families
+  (and vision projectors via a second `FROM`) need a recent release, otherwise `ollama create`
+  fails with an unsupported-architecture error. See [Updating Ollama](gguf-to-ollama/README.md#updating-ollama).
 
 Each tool directory is a self-contained uv project — see its README for usage.
 
