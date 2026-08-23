@@ -1,0 +1,123 @@
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+_SCRIPT = Path(__file__).resolve().parents[1] / "qwen38-27b-ollama.py"
+_spec = importlib.util.spec_from_file_location("qwen_tool", _SCRIPT)
+tool = importlib.util.module_from_spec(_spec)
+sys.modules["qwen_tool"] = tool
+_spec.loader.exec_module(tool)
+
+
+def test_group_quants_groups_shards_and_skips_extras():
+    files = [
+        "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+        "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+        "Qwen3.8-27B-UD-Q4_K_M.gguf",
+        "mmproj-F16.gguf",
+        "imatrix_unsloth.gguf",
+        "MTP/Qwen3.8-27B-MTP.gguf",
+    ]
+    quants = tool.group_quants(files)
+    assert quants == {
+        "BF16": [
+            "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+            "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+        ],
+        "UD-Q4_K_M": ["Qwen3.8-27B-UD-Q4_K_M.gguf"],
+    }
+
+
+def test_find_mmproj_prefers_f16():
+    files = ["mmproj-BF16.gguf", "mmproj-F16.gguf", "Qwen3.8-27B-Q8_0.gguf"]
+    assert tool.find_mmproj(files) == "mmproj-F16.gguf"
+
+
+def test_find_mmproj_falls_back_to_any_mmproj():
+    assert tool.find_mmproj(["mmproj-BF16.gguf", "x.gguf"]) == "mmproj-BF16.gguf"
+    assert tool.find_mmproj(["x.gguf"]) is None
+
+
+def test_vendored_tools_sorted_numerically(tmp_path):
+    for tag in ("llama-b9999", "llama-b10599", "llama-b123"):
+        d = tmp_path / "tools" / tag
+        d.mkdir(parents=True)
+        (d / "llama-gguf-split").write_text("")
+    found = tool.vendored_gguf_splits(tmp_path)
+    assert [p.parent.name for p in found] == ["llama-b10599", "llama-b9999", "llama-b123"]
+
+
+def test_merged_path_and_shard_count(tmp_path):
+    paths = ["BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf"]
+    with pytest.raises(SystemExit):
+        tool.merged_path_for(paths, tmp_path)  # declares 2 shards, only 1 listed
+
+
+def test_merged_path_ok(tmp_path):
+    paths = [
+        "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+        "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+    ]
+    assert tool.merged_path_for(paths, tmp_path) == tmp_path / "BF16" / "Qwen3.8-27B-BF16.gguf"
+    assert tool.merged_path_for(["Qwen3.8-27B-Q8_0.gguf"], tmp_path) is None
+    # A lone "-00001-of-00001" file needs no merge.
+    assert tool.merged_path_for(["Qwen3.8-27B-Q8_0-00001-of-00001.gguf"], tmp_path) is None
+
+
+def _fake_merge(tmp_path, script_body):
+    """Two dummy shards, an output path, and a fake llama-gguf-split running script_body."""
+    shards = [tmp_path / f"m-0000{i}-of-00002.gguf" for i in (1, 2)]
+    for p in shards:
+        p.write_bytes(b"x")
+    out = tmp_path / "m.gguf"
+    fake = tmp_path / "fake-split"
+    fake.write_text("#!/bin/sh\n" + script_body)
+    fake.chmod(0o755)
+    return shards, out, str(fake)
+
+
+def test_merge_shards_leaves_no_partial_on_failure(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, 'echo partial > "$3"\nexit 1\n')
+    with pytest.raises(SystemExit):
+        tool.merge_shards(shards, out, fake)
+    assert not out.exists()
+    assert not out.with_name(out.name + ".part").exists()
+
+
+def test_merge_shards_renames_on_success(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, 'echo merged > "$3"\n')
+    assert tool.merge_shards(shards, out, fake) == out
+    assert out.read_text().strip() == "merged"
+    assert not out.with_name(out.name + ".part").exists()
+
+
+def test_merge_shards_clears_stale_part(tmp_path):
+    # llama-gguf-split refuses to overwrite an existing output; emulate that.
+    shards, out, fake = _fake_merge(
+        tmp_path, 'if [ -e "$3" ]; then echo exists >&2; exit 1; fi\necho merged > "$3"\n'
+    )
+    out.with_name(out.name + ".part").write_text("stale")
+    assert tool.merge_shards(shards, out, fake) == out
+    assert out.read_text().strip() == "merged"
+
+
+def test_merge_shards_non_executable_tool_dies_cleanly(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, "")
+    Path(fake).chmod(0o644)
+    with pytest.raises(SystemExit):
+        tool.merge_shards(shards, out, fake)
+    assert not out.with_name(out.name + ".part").exists()
+
+
+def test_merge_shards_missing_shard_dies(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, "")
+    shards[1].unlink()
+    with pytest.raises(SystemExit):
+        tool.merge_shards(shards, out, fake)
+
+
+def test_find_gguf_split_dies_on_bad_explicit_path(tmp_path):
+    with pytest.raises(SystemExit):
+        tool.find_gguf_split(str(tmp_path / "nope"))
