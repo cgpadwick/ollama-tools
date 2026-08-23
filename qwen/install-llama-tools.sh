@@ -18,14 +18,21 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     exit 1
 fi
 
-AUTH=()
+# Empty-array expansion is an "unbound variable" error on bash < 4.4 under set -u,
+# so keep the optional header in a plain string (token has no spaces).
+AUTH_HEADER=""
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    AUTH_HEADER="Authorization: Bearer ${GITHUB_TOKEN}"
 fi
+
+verify() {
+    # Succeed only if the binary actually runs (catches missing shared libs / glibc).
+    "$1" --help >/dev/null 2>&1
+}
 
 echo "==> finding latest llama.cpp release with an ubuntu-${ASSET_ARCH} build"
 read -r TAG URL < <(
-    curl -sfL "${AUTH[@]}" "https://api.github.com/repos/${REPO}/releases?per_page=10" |
+    curl -sfL ${AUTH_HEADER:+-H} ${AUTH_HEADER:+"$AUTH_HEADER"} "https://api.github.com/repos/${REPO}/releases?per_page=10" |
     python3 -c "
 import json, sys
 arch = '${ASSET_ARCH}'
@@ -42,8 +49,12 @@ sys.exit('no matching release asset found')
 # Release archives extract to a single top-level dir "llama-<tag>/", e.g. llama-b10599/.
 BUILD_DIR="$DEST/llama-$TAG"
 if [[ -x "$BUILD_DIR/llama-gguf-split" ]]; then
-    echo "==> $TAG already installed at $BUILD_DIR; nothing to do"
-    exit 0
+    if verify "$BUILD_DIR/llama-gguf-split"; then
+        echo "==> $TAG already installed at $BUILD_DIR; nothing to do"
+        exit 0
+    fi
+    echo "==> $TAG present at $BUILD_DIR but does not run; reinstalling"
+    rm -rf "$BUILD_DIR"
 fi
 
 echo "==> downloading ${TAG}"
@@ -54,17 +65,20 @@ curl -fL --progress-bar -o "$tmp/llama.tar.gz" "$URL"
 tar xzf "$tmp/llama.tar.gz" -C "$DEST"
 
 BIN="$BUILD_DIR/llama-gguf-split"
-[[ -f "$BIN" ]] || { echo "llama-gguf-split missing from archive (expected $BIN)" >&2; exit 1; }
+[[ -f "$BIN" ]] || { rm -rf "$BUILD_DIR"; echo "llama-gguf-split missing from archive (expected $BIN)" >&2; exit 1; }
 chmod +x "$BIN"
 
-# Remove older vendored builds so only the one we just verified remains.
-find "$DEST" -mindepth 1 -maxdepth 1 -type d -name 'llama-b*' ! -name "llama-$TAG" -exec rm -rf {} +
-
-echo "==> installed: $BIN"
-if ! "$BIN" --help >/dev/null 2>&1; then
+# Verify BEFORE touching older builds, so a broken new release never destroys a
+# working one. On failure remove the new build; any previous build stays usable.
+if ! verify "$BIN"; then
     echo "error: $BIN does not run (missing shared libraries?). Output:" >&2
     "$BIN" --help 2>&1 | head -5 >&2 || true
+    rm -rf "$BUILD_DIR"
     exit 1
 fi
+echo "==> installed: $BIN"
 echo "==> verified working"
+
+# Now that the new build is known-good, remove older vendored builds.
+find "$DEST" -mindepth 1 -maxdepth 1 -type d -name 'llama-b*' ! -name "llama-$TAG" -exec rm -rf {} +
 echo "qwen38-27b-ollama.py will now find it automatically."

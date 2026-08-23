@@ -62,33 +62,60 @@ def test_merged_path_ok(tmp_path):
     ]
     assert tool.merged_path_for(paths, tmp_path) == tmp_path / "BF16" / "Qwen3.8-27B-BF16.gguf"
     assert tool.merged_path_for(["Qwen3.8-27B-Q8_0.gguf"], tmp_path) is None
+    # A lone "-00001-of-00001" file needs no merge.
+    assert tool.merged_path_for(["Qwen3.8-27B-Q8_0-00001-of-00001.gguf"], tmp_path) is None
+
+
+def _fake_merge(tmp_path, script_body):
+    """Two dummy shards, an output path, and a fake llama-gguf-split running script_body."""
+    shards = [tmp_path / f"m-0000{i}-of-00002.gguf" for i in (1, 2)]
+    for p in shards:
+        p.write_bytes(b"x")
+    out = tmp_path / "m.gguf"
+    fake = tmp_path / "fake-split"
+    fake.write_text("#!/bin/sh\n" + script_body)
+    fake.chmod(0o755)
+    return shards, out, str(fake)
 
 
 def test_merge_shards_leaves_no_partial_on_failure(tmp_path):
-    first = tmp_path / "m-00001-of-00002.gguf"
-    first.write_bytes(b"x")
-    (tmp_path / "m-00002-of-00002.gguf").write_bytes(b"x")
-    out = tmp_path / "m.gguf"
-    bad_tool = tmp_path / "fake-split"
-    bad_tool.write_text("#!/bin/sh\necho partial > \"$3\"\nexit 1\n")
-    bad_tool.chmod(0o755)
+    shards, out, fake = _fake_merge(tmp_path, 'echo partial > "$3"\nexit 1\n')
     with pytest.raises(SystemExit):
-        tool.merge_shards(first, out, str(bad_tool))
+        tool.merge_shards(shards, out, fake)
     assert not out.exists()
     assert not out.with_name(out.name + ".part").exists()
 
 
 def test_merge_shards_renames_on_success(tmp_path):
-    first = tmp_path / "m-00001-of-00002.gguf"
-    first.write_bytes(b"x")
-    (tmp_path / "m-00002-of-00002.gguf").write_bytes(b"x")
-    out = tmp_path / "m.gguf"
-    good_tool = tmp_path / "fake-split"
-    good_tool.write_text("#!/bin/sh\necho merged > \"$3\"\n")
-    good_tool.chmod(0o755)
-    assert tool.merge_shards(first, out, str(good_tool)) == out
+    shards, out, fake = _fake_merge(tmp_path, 'echo merged > "$3"\n')
+    assert tool.merge_shards(shards, out, fake) == out
     assert out.read_text().strip() == "merged"
     assert not out.with_name(out.name + ".part").exists()
+
+
+def test_merge_shards_clears_stale_part(tmp_path):
+    # llama-gguf-split refuses to overwrite an existing output; emulate that.
+    shards, out, fake = _fake_merge(
+        tmp_path, 'if [ -e "$3" ]; then echo exists >&2; exit 1; fi\necho merged > "$3"\n'
+    )
+    out.with_name(out.name + ".part").write_text("stale")
+    assert tool.merge_shards(shards, out, fake) == out
+    assert out.read_text().strip() == "merged"
+
+
+def test_merge_shards_non_executable_tool_dies_cleanly(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, "")
+    Path(fake).chmod(0o644)
+    with pytest.raises(SystemExit):
+        tool.merge_shards(shards, out, fake)
+    assert not out.with_name(out.name + ".part").exists()
+
+
+def test_merge_shards_missing_shard_dies(tmp_path):
+    shards, out, fake = _fake_merge(tmp_path, "")
+    shards[1].unlink()
+    with pytest.raises(SystemExit):
+        tool.merge_shards(shards, out, fake)
 
 
 def test_find_gguf_split_dies_on_bad_explicit_path(tmp_path):

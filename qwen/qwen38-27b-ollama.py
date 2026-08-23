@@ -61,13 +61,19 @@ def _import_hf():
     return huggingface_hub
 
 
-def list_repo_ggufs() -> list[str]:
+def fetch_repo_ggufs() -> tuple[list[str], dict[str, int]]:
+    """Return (sorted .gguf paths in the repo, {path: size in bytes})."""
     hf = _import_hf()
     try:
-        files = hf.HfApi().list_repo_files(REPO_ID)
+        info = hf.HfApi().model_info(REPO_ID, files_metadata=True)
     except Exception as e:  # network, auth, 404 — all fatal here
         die(f"could not list files in {REPO_ID}: {e}")
-    return sorted(f for f in files if f.endswith(".gguf"))
+    sizes = {s.rfilename: s.size or 0 for s in info.siblings if s.rfilename.endswith(".gguf")}
+    return sorted(sizes), sizes
+
+
+def list_repo_ggufs() -> list[str]:
+    return fetch_repo_ggufs()[0]
 
 
 def group_quants(files: list[str]) -> dict[str, list[str]]:
@@ -157,35 +163,39 @@ def find_gguf_split(explicit: str | None) -> str:
     )
 
 
-def check_free_space(shards: list[Path], out_dir: Path) -> None:
-    need = sum(p.stat().st_size for p in shards if p.exists())
-    free = shutil.disk_usage(out_dir).free
+def check_free_space(need: int, where: Path, what: str) -> None:
+    where.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(where).free
     if free < need:
         die(
-            f"not enough free space in {out_dir} to merge: need ~{need / 2**30:.1f} GiB, "
+            f"not enough free space in {where} to {what}: need ~{need / 2**30:.1f} GiB, "
             f"have {free / 2**30:.1f} GiB"
         )
 
 
-def merge_shards(first_shard: Path, out_path: Path, tool: str | None) -> Path:
+def merge_shards(shards: list[Path], out_path: Path, tool: str | None) -> Path:
     # Resolve the tool lazily so an existing merge does not require llama.cpp.
     tool_path = find_gguf_split(tool)
-    stem = SPLIT_RE.match(first_shard.name).group("stem")
-    shards = sorted(first_shard.parent.glob(f"{stem}-*-of-*.gguf"))
-    check_free_space(shards, out_path.parent)
+    missing = [p for p in shards if not p.exists()]
+    if missing:
+        die(f"shards missing on disk: {[p.name for p in missing]}")
+    check_free_space(sum(p.stat().st_size for p in shards), out_path.parent, "merge")
 
     # Write to a .part file and rename on success so an interrupted merge never
     # leaves a truncated file that a later run mistakes for a finished one.
+    # llama-gguf-split refuses to overwrite, so clear any stale .part first.
     part = out_path.with_name(out_path.name + ".part")
+    part.unlink(missing_ok=True)
     print(f"==> merging shards into {out_path}")
     try:
-        subprocess.run([tool_path, "--merge", str(first_shard), str(part)], check=True)
-    except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
-        part.unlink(missing_ok=True)
-        if isinstance(e, KeyboardInterrupt):
-            die("merge interrupted; removed partial output")
+        subprocess.run([tool_path, "--merge", str(shards[0]), str(part)], check=True)
+        part.replace(out_path)
+    except subprocess.CalledProcessError as e:
         die(f"llama-gguf-split failed with exit code {e.returncode}")
-    part.replace(out_path)
+    except OSError as e:
+        die(f"could not run {tool_path}: {e}")
+    finally:
+        part.unlink(missing_ok=True)
     return out_path
 
 
@@ -200,6 +210,8 @@ def merged_path_for(paths: list[str], workdir: Path) -> Path | None:
     total = int(m.group("total"))
     if total != len(paths):
         die(f"quant declares {total} shards but the repo lists {len(paths)}: {paths}")
+    if total == 1:
+        return None  # "-00001-of-00001": nothing to merge, use the file as-is
     return first.parent / (m.group("stem") + ".gguf")
 
 
@@ -208,9 +220,8 @@ def resolve_model_file(paths: list[str], workdir: Path, tool: str | None) -> Pat
     if merged is None:
         return workdir / paths[0]
     if merged.exists():
-        print(f"==> merged file already exists: {merged}")
         return merged
-    return merge_shards(workdir / paths[0], merged, tool)
+    return merge_shards([workdir / p for p in paths], merged, tool)
 
 
 def write_modelfile(model: Path, mmproj: Path | None, workdir: Path) -> Path:
@@ -262,7 +273,7 @@ def main() -> None:
     ap.add_argument("--download-only", action="store_true", help="download/merge but do not import")
     args = ap.parse_args()
 
-    files = list_repo_ggufs()
+    files, sizes = fetch_repo_ggufs()
     quants = group_quants(files)
 
     if args.list:
@@ -293,6 +304,11 @@ def main() -> None:
         patterns.append(mmproj_repo)
 
     if patterns:
+        # Check disk up front: bytes still to download, plus the merged copy if sharded.
+        need = sum(sizes.get(p, 0) for p in patterns if not (args.dir / p).exists())
+        if merged is not None and not merged.exists():
+            need += sum(sizes.get(p, 0) for p in paths)
+        check_free_space(need, args.dir, "download and merge" if merged else "download")
         hf_download(patterns, args.dir)
 
     model = resolve_model_file(paths, args.dir, args.gguf_split)

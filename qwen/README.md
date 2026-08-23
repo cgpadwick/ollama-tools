@@ -73,11 +73,13 @@ uv run pytest
   merged file is ~96 bytes larger than a natively-unsplit one because llama.cpp leaves
   `split.*` metadata keys behind with `split.count = 0`; tensor data is identical and
   loaders ignore them.
-- `install-llama-tools.sh` is idempotent and keeps only the newest vendored build. Set
+- `install-llama-tools.sh` is idempotent: it re-verifies an existing build, replaces it
+  if it no longer runs, and only prunes older builds after the new one is verified. Set
   `GITHUB_TOKEN` if you hit the unauthenticated GitHub API rate limit.
 - The `mmproj-*.gguf` projector is discovered from the repo listing (F16 preferred); if
   none exists the script stops and asks for `--no-mmproj`.
 - If `~/.cache/huggingface` is not writable, the script automatically falls back to
   `~/.cache/huggingface-local`.
 - BF16 is ~54 GB across both shards, and merging needs roughly that much *additional*
-  free space before the shards can be deleted.
+  free space before the shards can be deleted. The script checks for download + merge
+  space up front (using sizes from the Hub) before pulling anything.
