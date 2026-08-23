@@ -201,3 +201,107 @@ def test_modelfile_contents(tmp_path):
     assert "PARAMETER num_ctx 4096" in text
     path = tool.write_modelfile(model, None, tmp_path, preset="none", num_ctx=None)
     assert "PARAMETER" not in path.read_text()
+
+
+# --- GGUF metadata / auto num_ctx ---
+
+import struct
+
+
+def _gguf_bytes(meta: dict) -> bytes:
+    """Minimal GGUF v3 file: header + metadata KVs, no tensors."""
+    def _string(v):
+        b = v.encode()
+        return struct.pack("<Q", len(b)) + b
+
+    out = b"GGUF" + struct.pack("<IQQ", 3, 0, len(meta))
+    for k, v in meta.items():
+        out += _string(k)
+        if isinstance(v, bool):
+            out += struct.pack("<I", 7) + struct.pack("<?", v)
+        elif isinstance(v, int):
+            out += struct.pack("<I", 4) + struct.pack("<I", v)  # u32
+        elif isinstance(v, float):
+            out += struct.pack("<I", 6) + struct.pack("<f", v)
+        elif isinstance(v, str):
+            out += struct.pack("<I", 8) + _string(v)
+        elif isinstance(v, list):  # array of u32
+            out += struct.pack("<I", 9) + struct.pack("<IQ", 4, len(v))
+            for x in v:
+                out += struct.pack("<I", x)
+        else:
+            raise AssertionError(v)
+    return out
+
+
+QWENISH = {
+    "general.architecture": "qwen3",
+    "qwen3.context_length": 262144,
+    "qwen3.block_count": 48,
+    "qwen3.attention.head_count": 32,
+    "qwen3.attention.head_count_kv": 8,
+    "qwen3.attention.key_length": 128,
+    "qwen3.embedding_length": 4096,
+    "general.name": "test",
+    "some.bool": True,
+    "some.float": 1.5,
+    "some.array": [1, 2, 3],
+}
+
+
+def test_read_gguf_metadata(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(QWENISH))
+    meta = tool.read_gguf_metadata(f)
+    assert meta["general.architecture"] == "qwen3"
+    assert meta["qwen3.context_length"] == 262144
+    assert meta["qwen3.attention.head_count_kv"] == 8
+    assert meta["some.array"] is None  # arrays consumed, not materialized
+
+
+def test_read_gguf_metadata_survives_absurd_string_length(tmp_path):
+    import struct as _st
+
+    f = tmp_path / "m.gguf"
+    # header + one key whose declared length is 2**63 (OverflowError territory)
+    f.write_bytes(b"GGUF" + _st.pack("<IQQ", 3, 0, 1) + _st.pack("<Q", 2**63) + b"x")
+    assert tool.read_gguf_metadata(f) is None
+
+
+def test_kv_bytes_per_token_asymmetric_kv(tmp_path):
+    meta = dict(QWENISH)
+    meta["qwen3.attention.value_length"] = 64
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(meta))
+    parsed = tool.read_gguf_metadata(f)
+    # layers * kv_heads * (k_dim + v_dim) * 2 bytes
+    assert tool.kv_bytes_per_token(parsed) == 48 * 8 * (128 + 64) * 2
+
+
+def test_kv_bytes_per_token(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(QWENISH))
+    meta = tool.read_gguf_metadata(f)
+    # 2 (K+V) * 48 layers * 8 kv heads * 128 head dim * 2 bytes (f16)
+    assert tool.kv_bytes_per_token(meta) == 2 * 48 * 8 * 128 * 2
+    assert tool.native_ctx(meta) == 262144
+
+
+def test_read_gguf_metadata_rejects_non_gguf(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(b"not a gguf")
+    assert tool.read_gguf_metadata(f) is None
+
+
+def test_auto_num_ctx_returns_native(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(QWENISH))
+    assert tool.auto_num_ctx(f) == 262144
+
+
+def test_auto_num_ctx_none_without_context(tmp_path):
+    meta = dict(QWENISH)
+    del meta["qwen3.context_length"]
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(meta))
+    assert tool.auto_num_ctx(f) is None
