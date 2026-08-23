@@ -256,6 +256,26 @@ def test_read_gguf_metadata(tmp_path):
     assert meta["general.architecture"] == "qwen3"
     assert meta["qwen3.context_length"] == 262144
     assert meta["qwen3.attention.head_count_kv"] == 8
+    assert meta["some.array"] is None  # arrays consumed, not materialized
+
+
+def test_read_gguf_metadata_survives_absurd_string_length(tmp_path):
+    import struct as _st
+
+    f = tmp_path / "m.gguf"
+    # header + one key whose declared length is 2**63 (OverflowError territory)
+    f.write_bytes(b"GGUF" + _st.pack("<IQQ", 3, 0, 1) + _st.pack("<Q", 2**63) + b"x")
+    assert tool.read_gguf_metadata(f) is None
+
+
+def test_kv_bytes_per_token_asymmetric_kv(tmp_path):
+    meta = dict(QWENISH)
+    meta["qwen3.attention.value_length"] = 64
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(meta))
+    parsed = tool.read_gguf_metadata(f)
+    # layers * kv_heads * (k_dim + v_dim) * 2 bytes
+    assert tool.kv_bytes_per_token(parsed) == 48 * 8 * (128 + 64) * 2
 
 
 def test_kv_bytes_per_token(tmp_path):

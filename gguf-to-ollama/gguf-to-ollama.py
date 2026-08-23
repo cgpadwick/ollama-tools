@@ -323,8 +323,9 @@ def resolve_model_file(paths: list[str], workdir: Path, tool: str | None) -> Pat
 def read_gguf_metadata(path: Path) -> dict | None:
     """Parse the metadata KV section of a GGUF file (header only, no tensor data).
 
-    Returns None if the file is not a readable GGUF. Array values are skipped
-    (returned as None) except arrays are not needed for anything we look up.
+    Returns None if the file is not a readable GGUF. Array values are consumed
+    from the stream but returned as None — nothing we look up is an array, and
+    real headers carry huge tokenizer arrays not worth materializing.
     """
     _SCALARS = {
         0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2), 4: ("<I", 4),
@@ -352,9 +353,11 @@ def read_gguf_metadata(path: Path) -> dict | None:
                     return scalar(t)
                 if t == 8:
                     return string()
-                if t == 9:  # array: elem type, count, elems (parsed but unused)
+                if t == 9:  # array: consume elems to advance the stream, keep nothing
                     et, n = struct.unpack("<IQ", take(12))
-                    return [value(et) for _ in range(n)]
+                    for _ in range(n):
+                        value(et)
+                    return None
                 raise ValueError(f"unknown GGUF value type {t}")
 
             if take(4) != b"GGUF":
@@ -368,7 +371,7 @@ def read_gguf_metadata(path: Path) -> dict | None:
                 (t,) = struct.unpack("<I", take(4))
                 meta[key] = value(t)
             return meta
-    except (OSError, EOFError, ValueError, KeyError, struct.error):
+    except (OSError, EOFError, ValueError, KeyError, struct.error, OverflowError, MemoryError):
         return None
 
 
@@ -385,14 +388,15 @@ def kv_bytes_per_token(meta: dict) -> int | None:
         return None
     layers = meta.get(f"{arch}.block_count")
     kv_heads = meta.get(f"{arch}.attention.head_count_kv")
-    head_dim = meta.get(f"{arch}.attention.key_length")
-    if head_dim is None:
-        emb = meta.get(f"{arch}.embedding_length")
-        heads = meta.get(f"{arch}.attention.head_count")
-        head_dim = emb // heads if emb and heads else None
-    if not (layers and kv_heads and head_dim):
+    emb = meta.get(f"{arch}.embedding_length")
+    heads = meta.get(f"{arch}.attention.head_count")
+    default_dim = emb // heads if emb and heads else None
+    # K and V widths can differ (e.g. MLA-style attention): read each, fall back per-side.
+    k_dim = meta.get(f"{arch}.attention.key_length") or default_dim
+    v_dim = meta.get(f"{arch}.attention.value_length") or default_dim
+    if not (layers and kv_heads and k_dim and v_dim):
         return None
-    return 2 * int(layers) * int(kv_heads) * int(head_dim) * 2  # K+V, f16
+    return int(layers) * int(kv_heads) * (int(k_dim) + int(v_dim)) * 2  # K+V, f16
 
 
 def auto_num_ctx(model: Path) -> int | None:
