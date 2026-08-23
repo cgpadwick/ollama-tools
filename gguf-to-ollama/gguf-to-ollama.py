@@ -395,48 +395,20 @@ def kv_bytes_per_token(meta: dict) -> int | None:
     return 2 * int(layers) * int(kv_heads) * int(head_dim) * 2  # K+V, f16
 
 
-def available_memory_bytes() -> int | None:
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    try:  # rough fallback: total physical RAM
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        return None
-
-
-def pick_num_ctx(native: int | None, kv_per_token: int | None, avail: int | None, model_bytes: int) -> int | None:
-    """Largest multiple of 4096 whose KV cache fits next to the weights, capped at native."""
-    if native is None:
-        return None
-    if kv_per_token is None or avail is None:
-        return native
-    budget = avail - int(model_bytes * 1.1)  # weights + overhead margin
-    fit = budget // kv_per_token if budget > 0 else 0
-    ctx = min(native, (fit // 4096) * 4096)
-    return max(ctx, 4096)
-
-
 def auto_num_ctx(model: Path) -> int | None:
-    """Pick num_ctx from the model's GGUF header and available memory; None = no opinion."""
+    """The model's native context length from its GGUF header; None if unreadable."""
     meta = read_gguf_metadata(model)
     if meta is None:
         return None
     native = native_ctx(meta)
-    kv = kv_bytes_per_token(meta)
-    avail = available_memory_bytes()
-    ctx = pick_num_ctx(native, kv, avail, model.stat().st_size)
-    if ctx is None:
+    if native is None:
         return None
-    detail = f"native {native}"
-    if kv is not None and avail is not None:
-        detail += f", KV ~{kv / 2**20:.2f} MiB/token, ~{avail / 2**30:.0f} GiB available"
-    print(f"==> num_ctx {ctx} (auto: {detail}; override with --num-ctx)")
-    return ctx
+    note = ""
+    kv = kv_bytes_per_token(meta)
+    if kv is not None:
+        note = f"; f16 KV cache at full context ~{native * kv / 2**30:.0f} GiB"
+    print(f"==> num_ctx {native} (model's native context{note}; override with --num-ctx)")
+    return native
 
 
 def write_modelfile(
@@ -489,8 +461,8 @@ def main() -> None:
     ap.add_argument(
         "--num-ctx",
         type=int,
-        help="PARAMETER num_ctx (default: auto — largest context that fits in memory, "
-        "capped at the model's native length; 0 to omit and use Ollama's default)",
+        help="PARAMETER num_ctx (default: the model's native context length from its "
+        "GGUF header; 0 to omit and use Ollama's default)",
     )
     ap.add_argument("--gguf-split", help="path to llama-gguf-split (for split builds)")
     ap.add_argument("--no-mmproj", action="store_true", help="skip the vision projector even if the repo has one")

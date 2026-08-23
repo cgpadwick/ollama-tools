@@ -106,7 +106,7 @@ ollama run qwen3.8-27b:ud-q4_k_m          # default name is <model>:<quant>, low
 | `--dir` | Download directory (default `~/models/<org>/<repo name>`) |
 | `--name` | Ollama model name (default `<model>:<quant>`, e.g. `qwen3.8-27b:ud-q4_k_m`) |
 | `--preset` | Modelfile sampling preset: `qwen3`, `qwen3-thinking`, `none` (default `qwen3` for Qwen3 repos, else `none`) |
-| `--num-ctx` | `PARAMETER num_ctx` (default: **auto** — largest context that fits in memory, capped at the model's native length; `0` to omit and use Ollama's default) |
+| `--num-ctx` | `PARAMETER num_ctx` (default: the model's native context length from its GGUF header; `0` to omit and use Ollama's default) |
 | `--gguf-split` | Path to `llama-gguf-split`; auto-detected from `tools/` if installed |
 | `--no-mmproj` | Skip the vision projector even if the repo has one |
 | `--download-only` | Download and merge, but skip `ollama create` |
@@ -138,16 +138,13 @@ uv run pytest
   The default is chosen from the repo name (`*Qwen3*Thinking*` → `qwen3-thinking`,
   `*Qwen3*` → `qwen3`, embedding/reranker → `none`, anything else → `none`) and printed;
   override with `--preset`, or edit the generated `Modelfile` and re-run `ollama create`.
-- **Context length (`num_ctx`)**: by default the script reads the model's GGUF header
-  (native context length, layers, KV heads) and sets the largest `num_ctx` — in 4096
-  steps, capped at the native length — whose f16 KV cache fits in currently available
-  memory next to the weights, and prints the calculation. Pass `--num-ctx N` to pin a
-  value (e.g. `--num-ctx 65536`), or `--num-ctx 0` to omit the parameter and use
-  Ollama's own default. The estimate uses system RAM (`MemAvailable`); on a
-  discrete-GPU box where the KV cache must fit in VRAM, set `--num-ctx` yourself.
-  Mind the tradeoff: on a 27B model a 64K context adds tens of GB, so a q8_0 or q4
-  quant leaves far more headroom than BF16. Re-running with a different
-  `--num-ctx`/`--name` reuses the downloaded GGUFs — only `ollama create` runs again.
+- **Context length (`num_ctx`)**: by default the script reads the model's native context
+  length from the GGUF header and bakes that in (e.g. 262144 for Qwen3.8-27B), printing an
+  estimate of the f16 KV-cache size at full context. Pass `--num-ctx N` to use a smaller
+  (or any specific) value, or `--num-ctx 0` to omit the parameter and use Ollama's default.
+  Mind the memory: a full-context KV cache on a big model can add tens of GB on top of the
+  weights. Re-running with a different `--num-ctx`/`--name` reuses the downloaded GGUFs —
+  only `ollama create` runs again.
 - Merging requires `llama-gguf-split` (see `install-llama-tools.sh`). If the merged file
   already exists, the tool is not needed and the shards are not re-downloaded, so you can
   delete them after a successful merge. The merge writes to a `.part` file and renames it

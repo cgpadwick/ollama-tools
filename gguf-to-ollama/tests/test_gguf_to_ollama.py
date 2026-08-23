@@ -267,22 +267,21 @@ def test_kv_bytes_per_token(tmp_path):
     assert tool.native_ctx(meta) == 262144
 
 
-def test_pick_num_ctx_caps_and_floors():
-    kv = 2 * 48 * 8 * 128 * 2  # ~196 KiB/token
-    native = 262144
-    # plenty of memory -> native
-    assert tool.pick_num_ctx(native, kv, avail=10**12, model_bytes=0) == native
-    # tight memory -> multiple of 4096, above the floor
-    got = tool.pick_num_ctx(native, kv, avail=8 * 2**30, model_bytes=2 * 2**30)
-    assert got % 4096 == 0 and 4096 <= got < native
-    # hopeless memory -> floor of 4096
-    assert tool.pick_num_ctx(native, kv, avail=2**30, model_bytes=2**30) == 4096
-    # no metadata -> None (caller falls back)
-    assert tool.pick_num_ctx(None, kv, avail=10**12, model_bytes=0) is None
-    assert tool.pick_num_ctx(native, None, avail=10**12, model_bytes=0) == native
-
-
 def test_read_gguf_metadata_rejects_non_gguf(tmp_path):
     f = tmp_path / "m.gguf"
     f.write_bytes(b"not a gguf")
     assert tool.read_gguf_metadata(f) is None
+
+
+def test_auto_num_ctx_returns_native(tmp_path):
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(QWENISH))
+    assert tool.auto_num_ctx(f) == 262144
+
+
+def test_auto_num_ctx_none_without_context(tmp_path):
+    meta = dict(QWENISH)
+    del meta["qwen3.context_length"]
+    f = tmp_path / "m.gguf"
+    f.write_bytes(_gguf_bytes(meta))
+    assert tool.auto_num_ctx(f) is None
