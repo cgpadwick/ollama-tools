@@ -6,7 +6,7 @@ Utilities for getting models into [Ollama](https://ollama.com).
 
 | Directory | Description |
 | --- | --- |
-| [`qwen/`](qwen/) | Download Qwen3.8-27B GGUFs from Hugging Face, merge split shards, and import into Ollama |
+| [`gguf-to-ollama/`](gguf-to-ollama/) | Download GGUFs from any Hugging Face repo (unsloth, bartowski, …), merge split shards, and import into Ollama |
 
 ## Requirements
 

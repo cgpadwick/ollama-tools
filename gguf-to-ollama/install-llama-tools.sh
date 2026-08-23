@@ -81,4 +81,4 @@ echo "==> verified working"
 
 # Now that the new build is known-good, remove older vendored builds.
 find "$DEST" -mindepth 1 -maxdepth 1 -type d -name 'llama-b*' ! -name "llama-$TAG" -exec rm -rf {} +
-echo "qwen38-27b-ollama.py will now find it automatically."
+echo "gguf-to-ollama.py will now find it automatically."

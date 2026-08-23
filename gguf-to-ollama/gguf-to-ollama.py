@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Download Qwen3.8-27B GGUFs from Hugging Face, merge split shards, and import into Ollama.
+"""Download GGUFs from a Hugging Face repo, merge split shards, and import into Ollama.
 
-Note: https://huggingface.co/unsloth/Qwen3.8-27B holds safetensors, not GGUFs.
-The GGUFs live in https://huggingface.co/unsloth/Qwen3.8-27B-GGUF (used below).
-Only the BF16 build is sharded (2 files); every quant is a single file.
+Works with any repo laid out like the unsloth/bartowski GGUF repos:
+    <Model>-<quant>.gguf                       single-file quant
+    <dir>/<Model>-<quant>-00001-of-0000N.gguf  sharded quant (merged with llama-gguf-split)
+    mmproj-*.gguf                              optional vision projector
 
 Requires: huggingface_hub  (run `uv sync` in this directory)
-Optional: llama-gguf-split from llama.cpp (only needed for split builds such as BF16)
+Optional: llama-gguf-split from llama.cpp (only needed for sharded builds such as BF16)
+Optional: HF_TOKEN for gated repos (e.g. meta-llama/*, google/gemma*) — public repos need none.
 
 Examples:
-    ./qwen38-27b-ollama.py --list
-    ./qwen38-27b-ollama.py --quant UD-Q4_K_M
-    ./qwen38-27b-ollama.py --quant BF16 --gguf-split /opt/llama.cpp/build/bin/llama-gguf-split
-    ./qwen38-27b-ollama.py --quant UD-Q6_K --no-mmproj --name qwen38:q6k
+    ./gguf-to-ollama.py --list
+    ./gguf-to-ollama.py --quant UD-Q4_K_M
+    ./gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --list
+    ./gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q6_K --preset none
+    ./gguf-to-ollama.py --quant BF16 --gguf-split /opt/llama.cpp/build/bin/llama-gguf-split
+    ./gguf-to-ollama.py --quant UD-Q6_K --no-mmproj --name qwen38:q6k
 """
 
 from __future__ import annotations
@@ -26,8 +30,30 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-REPO_ID = "unsloth/Qwen3.8-27B-GGUF"
+DEFAULT_REPO = "unsloth/Qwen3.8-27B-GGUF"
 DEFAULT_QUANT = "UD-Q4_K_M"
+# Repo sub-directories that hold non-model GGUFs (e.g. Qwen's MTP draft heads).
+SKIP_DIRS = ("MTP",)
+
+# Modelfile sampling presets. "none" emits no sampling PARAMETERs (Ollama defaults apply).
+PRESETS: dict[str, list[str]] = {
+    "none": [],
+    # Unsloth's recommended defaults for Qwen3 in non-thinking mode.
+    "qwen3": [
+        "PARAMETER temperature 0.7",
+        "PARAMETER top_p 0.8",
+        "PARAMETER top_k 20",
+        "PARAMETER min_p 0.0",
+        "PARAMETER repeat_penalty 1.05",
+    ],
+    # Unsloth's recommended defaults for Qwen3 in thinking mode.
+    "qwen3-thinking": [
+        "PARAMETER temperature 0.6",
+        "PARAMETER top_p 0.95",
+        "PARAMETER top_k 20",
+        "PARAMETER min_p 0.0",
+    ],
+}
 SCRIPT_DIR = Path(__file__).resolve().parent
 # Matches "<stem>-00001-of-00002.gguf"
 SPLIT_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$")
@@ -61,33 +87,57 @@ def _import_hf():
     return huggingface_hub
 
 
-def fetch_repo_ggufs() -> tuple[list[str], dict[str, int]]:
+def repo_base(repo_id: str) -> str:
+    """'unsloth/Qwen3.8-27B-GGUF' -> 'Qwen3.8-27B' (the filename prefix used in the repo)."""
+    name = repo_id.rsplit("/", 1)[-1]
+    if name.lower().endswith("-gguf"):
+        name = name[: -len("-gguf")]
+    return name
+
+
+def default_preset(repo_id: str) -> str:
+    return "qwen3" if "qwen3" in repo_id.lower() else "none"
+
+
+def default_ollama_name(repo_id: str, quant: str) -> str:
+    return f"{repo_base(repo_id).lower()}:{quant.lower()}"
+
+
+def fetch_repo_ggufs(repo_id: str) -> tuple[list[str], dict[str, int]]:
     """Return (sorted .gguf paths in the repo, {path: size in bytes})."""
     hf = _import_hf()
     try:
-        info = hf.HfApi().model_info(REPO_ID, files_metadata=True)
+        info = hf.HfApi().model_info(repo_id, files_metadata=True)
     except Exception as e:  # network, auth, 404 — all fatal here
-        die(f"could not list files in {REPO_ID}: {e}")
+        die(f"could not list files in {repo_id}: {e}")
     sizes = {s.rfilename: s.size or 0 for s in info.siblings if s.rfilename.endswith(".gguf")}
     return sorted(sizes), sizes
 
 
-def list_repo_ggufs() -> list[str]:
-    return fetch_repo_ggufs()[0]
+def list_repo_ggufs(repo_id: str) -> list[str]:
+    return fetch_repo_ggufs(repo_id)[0]
 
 
-def group_quants(files: list[str]) -> dict[str, list[str]]:
-    """Map quant label -> ordered list of repo file paths belonging to it."""
+def group_quants(files: list[str], base: str) -> dict[str, list[str]]:
+    """Map quant label -> ordered list of repo file paths belonging to it.
+
+    `base` is the model-name prefix (see repo_base); it is stripped case-insensitively
+    from each filename to produce the label, e.g. "Qwen3.8-27B-UD-Q4_K_M" -> "UD-Q4_K_M".
+    Files that do not carry the prefix keep their full stem as the label.
+    """
     quants: dict[str, list[str]] = {}
+    prefix = base.lower() + "-"
     for path in files:
         name = Path(path).name
-        if name.startswith(("mmproj", "imatrix")) or path.startswith("MTP/"):
+        if name.startswith(("mmproj", "imatrix")):
+            continue
+        if any(path.startswith(d + "/") for d in SKIP_DIRS):
             continue
 
         m = SPLIT_RE.match(name)
         stem = m.group("stem") if m else name[: -len(".gguf")]
-        # "Qwen3.8-27B-UD-Q4_K_M" -> "UD-Q4_K_M"
-        quants.setdefault(stem.replace("Qwen3.8-27B-", "", 1), []).append(path)
+        label = stem[len(prefix):] if stem.lower().startswith(prefix) else stem
+        quants.setdefault(label, []).append(path)
 
     for paths in quants.values():
         paths.sort()
@@ -114,19 +164,25 @@ def hf_workers() -> int:
     return n
 
 
-def hf_download(patterns: list[str], dest: Path) -> None:
+def hf_download(repo_id: str, patterns: list[str], dest: Path) -> None:
     hf = _import_hf()
     dest.mkdir(parents=True, exist_ok=True)
-    print(f"==> downloading {patterns} -> {dest}")
+    print(f"==> downloading {patterns} from {repo_id} -> {dest}")
     try:
         hf.snapshot_download(
-            repo_id=REPO_ID,
+            repo_id=repo_id,
             allow_patterns=patterns,
             local_dir=str(dest),
             max_workers=hf_workers(),
         )
     except Exception as e:
-        die(f"download from {REPO_ID} failed: {e}")
+        hint = ""
+        if "gated" in str(e).lower() or "401" in str(e):
+            hint = (
+                "\nThis repo looks gated: accept its license on huggingface.co, then set "
+                "HF_TOKEN (or run `hf auth login`) and retry."
+            )
+        die(f"download from {repo_id} failed: {e}{hint}")
 
 
 def vendored_gguf_splits(root: Path) -> list[Path]:
@@ -224,21 +280,18 @@ def resolve_model_file(paths: list[str], workdir: Path, tool: str | None) -> Pat
     return merge_shards([workdir / p for p in paths], merged, tool)
 
 
-def write_modelfile(model: Path, mmproj: Path | None, workdir: Path) -> Path:
+def write_modelfile(
+    model: Path, mmproj: Path | None, workdir: Path, *, preset: str, num_ctx: int | None
+) -> Path:
     lines = [f"FROM {model.resolve()}"]
     if mmproj is not None:
         lines.append(f"FROM {mmproj.resolve()}")
-    lines += [
-        "",
-        # Unsloth's recommended sampling defaults for Qwen3.
-        "PARAMETER temperature 0.7",
-        "PARAMETER top_p 0.8",
-        "PARAMETER top_k 20",
-        "PARAMETER min_p 0.0",
-        "PARAMETER repeat_penalty 1.05",
-        "PARAMETER num_ctx 8192",
-        "",
-    ]
+    params = list(PRESETS[preset])
+    if num_ctx is not None:
+        params.append(f"PARAMETER num_ctx {num_ctx}")
+    if params:
+        lines += [""] + params
+    lines.append("")
     path = workdir / "Modelfile"
     path.write_text("\n".join(lines))
     print(f"==> wrote {path}")
@@ -264,17 +317,32 @@ def main() -> None:
         epilog="Set HF_WORKERS to change download parallelism (default 4).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument("--repo", default=DEFAULT_REPO, help=f"Hugging Face GGUF repo (default: {DEFAULT_REPO})")
     ap.add_argument("--quant", default=DEFAULT_QUANT, help=f"quant label (default: {DEFAULT_QUANT})")
     ap.add_argument("--list", action="store_true", help="list available quants and exit")
-    ap.add_argument("--dir", type=Path, default=Path.home() / "models" / "Qwen3.8-27B-GGUF")
-    ap.add_argument("--name", help="Ollama model name (default: qwen3.8-27b:<quant>)")
+    ap.add_argument("--dir", type=Path, help="download directory (default: ~/models/<repo name>)")
+    ap.add_argument("--name", help="Ollama model name (default: <model>:<quant>, lower-cased)")
+    ap.add_argument(
+        "--preset",
+        choices=sorted(PRESETS),
+        help="Modelfile sampling preset (default: qwen3 for Qwen3 repos, else none)",
+    )
+    ap.add_argument("--num-ctx", type=int, default=8192, help="PARAMETER num_ctx (default: 8192; 0 to omit)")
     ap.add_argument("--gguf-split", help="path to llama-gguf-split (for split builds)")
     ap.add_argument("--no-mmproj", action="store_true", help="skip the vision projector")
     ap.add_argument("--download-only", action="store_true", help="download/merge but do not import")
     args = ap.parse_args()
 
-    files, sizes = fetch_repo_ggufs()
-    quants = group_quants(files)
+    repo = args.repo
+    base = repo_base(repo)
+    workdir: Path = args.dir or Path.home() / "models" / repo.rsplit("/", 1)[-1]
+    preset = args.preset or default_preset(repo)
+    num_ctx = args.num_ctx or None
+
+    files, sizes = fetch_repo_ggufs(repo)
+    quants = group_quants(files, base)
+    if not quants:
+        die(f"no model GGUFs found in {repo}")
 
     if args.list:
         for label, paths in sorted(quants.items()):
@@ -290,7 +358,7 @@ def main() -> None:
 
     # Skip re-downloading shards when a previous run already produced the merged file
     # (the shards may have been deleted to reclaim space).
-    merged = merged_path_for(paths, args.dir)
+    merged = merged_path_for(paths, workdir)
     if merged is not None and merged.exists():
         print(f"==> merged file already exists, skipping shard download: {merged}")
     else:
@@ -300,30 +368,30 @@ def main() -> None:
     if not args.no_mmproj:
         mmproj_repo = find_mmproj(files)
         if mmproj_repo is None:
-            die(f"no mmproj-*.gguf in {REPO_ID}; pass --no-mmproj to import text-only")
+            die(f"no mmproj-*.gguf in {repo}; pass --no-mmproj to import text-only")
         patterns.append(mmproj_repo)
 
     if patterns:
         # Check disk up front: bytes still to download, plus the merged copy if sharded.
-        need = sum(sizes.get(p, 0) for p in patterns if not (args.dir / p).exists())
+        need = sum(sizes.get(p, 0) for p in patterns if not (workdir / p).exists())
         if merged is not None and not merged.exists():
             need += sum(sizes.get(p, 0) for p in paths)
-        check_free_space(need, args.dir, "download and merge" if merged else "download")
-        hf_download(patterns, args.dir)
+        check_free_space(need, workdir, "download and merge" if merged else "download")
+        hf_download(repo, patterns, workdir)
 
-    model = resolve_model_file(paths, args.dir, args.gguf_split)
+    model = resolve_model_file(paths, workdir, args.gguf_split)
     mmproj = None
     if mmproj_repo is not None:
-        mmproj = args.dir / mmproj_repo
+        mmproj = workdir / mmproj_repo
         if not mmproj.exists():
             die(f"expected {mmproj} after download but it is missing")
 
-    modelfile = write_modelfile(model, mmproj, args.dir)
+    modelfile = write_modelfile(model, mmproj, workdir, preset=preset, num_ctx=num_ctx)
     if args.download_only:
         print(f"Skipping import. Later: ollama create <name> -f {modelfile}")
         return
 
-    ollama_create(args.name or f"qwen3.8-27b:{args.quant.lower()}", modelfile)
+    ollama_create(args.name or default_ollama_name(repo, args.quant), modelfile)
 
 
 if __name__ == "__main__":
