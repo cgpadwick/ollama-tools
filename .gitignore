@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Vendored llama.cpp binaries fetched by install-llama-tools.sh
+tools/
+
+# Downloaded models
+models/
+*.gguf
+Modelfile
