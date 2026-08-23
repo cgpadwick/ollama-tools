@@ -14,7 +14,7 @@ Examples:
     ./gguf-to-ollama.py --list
     ./gguf-to-ollama.py --quant UD-Q4_K_M
     ./gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --list
-    ./gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q6_K --preset none
+    ./gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q6_K
     ./gguf-to-ollama.py --quant BF16 --gguf-split /opt/llama.cpp/build/bin/llama-gguf-split
     ./gguf-to-ollama.py --quant UD-Q6_K --no-mmproj --name qwen38:q6k
 """
@@ -31,9 +31,17 @@ from pathlib import Path
 from typing import NoReturn
 
 DEFAULT_REPO = "unsloth/Qwen3.8-27B-GGUF"
-DEFAULT_QUANT = "UD-Q4_K_M"
+# Tried in order when --quant is not given; first one the repo actually has wins.
+DEFAULT_QUANTS = ("UD-Q4_K_M", "Q4_K_M")
 # Repo sub-directories that hold non-model GGUFs (e.g. Qwen's MTP draft heads).
 SKIP_DIRS = ("MTP",)
+
+# (regex on repo id, preset) — first match wins; see default_preset().
+PRESET_RULES: list[tuple[str, str]] = [
+    (r"embedding|rerank", "none"),
+    (r"qwen3.*thinking", "qwen3-thinking"),
+    (r"qwen3", "qwen3"),
+]
 
 # Modelfile sampling presets. "none" emits no sampling PARAMETERs (Ollama defaults apply).
 PRESETS: dict[str, list[str]] = {
@@ -96,7 +104,20 @@ def repo_base(repo_id: str) -> str:
 
 
 def default_preset(repo_id: str) -> str:
-    return "qwen3" if "qwen3" in repo_id.lower() else "none"
+    rid = repo_id.lower()
+    for pattern, preset in PRESET_RULES:
+        if re.search(pattern, rid):
+            return preset
+    return "none"
+
+
+def default_workdir(repo_id: str) -> Path:
+    # Keep the org so unsloth/X-GGUF and Qwen/X-GGUF never share a directory.
+    return Path.home() / "models" / Path(*repo_id.split("/"))
+
+
+def is_mmproj(name: str) -> bool:
+    return "mmproj" in name.lower()
 
 
 def default_ollama_name(repo_id: str, quant: str) -> str:
@@ -125,18 +146,26 @@ def group_quants(files: list[str], base: str) -> dict[str, list[str]]:
     from each filename to produce the label, e.g. "Qwen3.8-27B-UD-Q4_K_M" -> "UD-Q4_K_M".
     Files that do not carry the prefix keep their full stem as the label.
     """
-    quants: dict[str, list[str]] = {}
-    prefix = base.lower() + "-"
+    stems: list[tuple[str, str]] = []  # (stem, repo path)
     for path in files:
         name = Path(path).name
-        if name.startswith(("mmproj", "imatrix")):
+        if is_mmproj(name) or "imatrix" in name.lower():
             continue
         if any(path.startswith(d + "/") for d in SKIP_DIRS):
             continue
-
         m = SPLIT_RE.match(name)
-        stem = m.group("stem") if m else name[: -len(".gguf")]
-        label = stem[len(prefix):] if stem.lower().startswith(prefix) else stem
+        stems.append((m.group("stem") if m else name[: -len(".gguf")], path))
+
+    # "<base>-Q4_K_M", "<base>.Q4_K_M" (TheBloke/mradermacher style) or "<base>_Q4_K_M"
+    prefix_re = re.compile(rf"^{re.escape(base)}[-._]", re.IGNORECASE)
+    if not any(prefix_re.match(stem) for stem, _ in stems):
+        # Repo name is not the filename prefix (e.g. mradermacher/X-i1-GGUF ships
+        # "X.i1-Q4_K_M.gguf"): fall back to the longest common filename prefix.
+        prefix_re = re.compile(rf"^{re.escape(_common_prefix([st for st, _ in stems]))}")
+
+    quants: dict[str, list[str]] = {}
+    for stem, path in stems:
+        label = prefix_re.sub("", stem, count=1) or stem
         quants.setdefault(label, []).append(path)
 
     for paths in quants.values():
@@ -144,11 +173,20 @@ def group_quants(files: list[str], base: str) -> dict[str, list[str]]:
     return quants
 
 
+def _common_prefix(stems: list[str]) -> str:
+    """Longest common prefix of stems, cut back to the last [-._] separator ('' if none)."""
+    if len(stems) < 2:
+        return ""
+    p = os.path.commonprefix(stems)
+    cut = max(p.rfind(c) for c in "-._")
+    return p[: cut + 1] if cut >= 0 else ""
+
+
 def find_mmproj(files: list[str]) -> str | None:
     """Pick the vision projector from the repo listing; prefer F16, else any mmproj."""
-    mmprojs = sorted(f for f in files if Path(f).name.startswith("mmproj"))
+    mmprojs = sorted(f for f in files if is_mmproj(Path(f).name))
     for f in mmprojs:
-        if Path(f).name == "mmproj-F16.gguf":
+        if re.search(r"(?<![a-z0-9])f16", Path(f).name.lower()):  # F16 but not BF16
             return f
     return mmprojs[0] if mmprojs else None
 
@@ -166,6 +204,8 @@ def hf_workers() -> int:
 
 def hf_download(repo_id: str, patterns: list[str], dest: Path) -> None:
     hf = _import_hf()
+    from huggingface_hub.errors import GatedRepoError
+
     dest.mkdir(parents=True, exist_ok=True)
     print(f"==> downloading {patterns} from {repo_id} -> {dest}")
     try:
@@ -175,14 +215,13 @@ def hf_download(repo_id: str, patterns: list[str], dest: Path) -> None:
             local_dir=str(dest),
             max_workers=hf_workers(),
         )
+    except GatedRepoError as e:
+        die(
+            f"{repo_id} is gated: accept its license on huggingface.co/{repo_id}, then set "
+            f"HF_TOKEN (or run `hf auth login`) and retry.\n{e}"
+        )
     except Exception as e:
-        hint = ""
-        if "gated" in str(e).lower() or "401" in str(e):
-            hint = (
-                "\nThis repo looks gated: accept its license on huggingface.co, then set "
-                "HF_TOKEN (or run `hf auth login`) and retry."
-            )
-        die(f"download from {repo_id} failed: {e}{hint}")
+        die(f"download from {repo_id} failed: {e}")
 
 
 def vendored_gguf_splits(root: Path) -> list[Path]:
@@ -318,9 +357,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"Hugging Face GGUF repo (default: {DEFAULT_REPO})")
-    ap.add_argument("--quant", default=DEFAULT_QUANT, help=f"quant label (default: {DEFAULT_QUANT})")
+    ap.add_argument("--quant", help=f"quant label (default: first of {', '.join(DEFAULT_QUANTS)} the repo has)")
     ap.add_argument("--list", action="store_true", help="list available quants and exit")
-    ap.add_argument("--dir", type=Path, help="download directory (default: ~/models/<repo name>)")
+    ap.add_argument("--dir", type=Path, help="download directory (default: ~/models/<org>/<repo name>)")
     ap.add_argument("--name", help="Ollama model name (default: <model>:<quant>, lower-cased)")
     ap.add_argument(
         "--preset",
@@ -329,13 +368,13 @@ def main() -> None:
     )
     ap.add_argument("--num-ctx", type=int, default=8192, help="PARAMETER num_ctx (default: 8192; 0 to omit)")
     ap.add_argument("--gguf-split", help="path to llama-gguf-split (for split builds)")
-    ap.add_argument("--no-mmproj", action="store_true", help="skip the vision projector")
+    ap.add_argument("--no-mmproj", action="store_true", help="skip the vision projector even if the repo has one")
     ap.add_argument("--download-only", action="store_true", help="download/merge but do not import")
     args = ap.parse_args()
 
     repo = args.repo
     base = repo_base(repo)
-    workdir: Path = args.dir or Path.home() / "models" / repo.rsplit("/", 1)[-1]
+    workdir: Path = args.dir or default_workdir(repo)
     preset = args.preset or default_preset(repo)
     num_ctx = args.num_ctx or None
 
@@ -350,10 +389,19 @@ def main() -> None:
             print(f"{label}{tag}")
         return
 
-    if args.quant not in quants:
-        die(f"unknown quant {args.quant!r}. Use --list to see options.")
+    quant = args.quant
+    if quant is None:
+        quant = next((q for q in DEFAULT_QUANTS if q in quants), None)
+        if quant is None:
+            die(
+                f"--quant not given and none of the defaults ({', '.join(DEFAULT_QUANTS)}) exist "
+                f"in {repo}. Available: {', '.join(sorted(quants))}"
+            )
+        print(f"==> no --quant given; using {quant}")
+    if quant not in quants:
+        die(f"unknown quant {quant!r}. Use --list to see options.")
 
-    paths = quants[args.quant]
+    paths = quants[quant]
     patterns: list[str] = []
 
     # Skip re-downloading shards when a previous run already produced the merged file
@@ -368,8 +416,9 @@ def main() -> None:
     if not args.no_mmproj:
         mmproj_repo = find_mmproj(files)
         if mmproj_repo is None:
-            die(f"no mmproj-*.gguf in {repo}; pass --no-mmproj to import text-only")
-        patterns.append(mmproj_repo)
+            print(f"==> no mmproj in {repo}; importing text-only")
+        else:
+            patterns.append(mmproj_repo)
 
     if patterns:
         # Check disk up front: bytes still to download, plus the merged copy if sharded.
@@ -386,12 +435,13 @@ def main() -> None:
         if not mmproj.exists():
             die(f"expected {mmproj} after download but it is missing")
 
+    print(f"==> sampling preset: {preset}" + ("" if args.preset else " (auto; override with --preset)"))
     modelfile = write_modelfile(model, mmproj, workdir, preset=preset, num_ctx=num_ctx)
     if args.download_only:
         print(f"Skipping import. Later: ollama create <name> -f {modelfile}")
         return
 
-    ollama_create(args.name or default_ollama_name(repo, args.quant), modelfile)
+    ollama_create(args.name or default_ollama_name(repo, quant), modelfile)
 
 
 if __name__ == "__main__":

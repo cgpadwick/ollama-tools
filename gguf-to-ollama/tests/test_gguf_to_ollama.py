@@ -130,11 +130,11 @@ def test_repo_base_strips_gguf_suffix():
     assert tool.repo_base("someone/plain") == "plain"
 
 
-def test_group_quants_without_prefix_keeps_full_stem():
+def test_group_quants_without_repo_prefix_uses_common_prefix():
     files = ["Other-Model-Q4_K_M.gguf", "Other-Model-Q8_0.gguf"]
     assert tool.group_quants(files, "Qwen3.8-27B") == {
-        "Other-Model-Q4_K_M": ["Other-Model-Q4_K_M.gguf"],
-        "Other-Model-Q8_0": ["Other-Model-Q8_0.gguf"],
+        "Q4_K_M": ["Other-Model-Q4_K_M.gguf"],
+        "Q8_0": ["Other-Model-Q8_0.gguf"],
     }
 
 
@@ -148,7 +148,42 @@ def test_group_quants_case_insensitive_prefix():
 def test_default_preset_detection():
     assert tool.default_preset("unsloth/Qwen3.8-27B-GGUF") == "qwen3"
     assert tool.default_preset("unsloth/Qwen3-8B-GGUF") == "qwen3"
+    assert tool.default_preset("unsloth/Qwen3-235B-A22B-Thinking-2507-GGUF") == "qwen3-thinking"
+    assert tool.default_preset("unsloth/Qwen3-Embedding-8B-GGUF") == "none"
     assert tool.default_preset("unsloth/gemma-3-27b-it-GGUF") == "none"
+
+
+def test_default_workdir_keeps_org():
+    assert tool.default_workdir("unsloth/Qwen3-8B-GGUF") != tool.default_workdir("Qwen/Qwen3-8B-GGUF")
+    assert tool.default_workdir("unsloth/Qwen3-8B-GGUF").parts[-2:] == ("unsloth", "Qwen3-8B-GGUF")
+
+
+def test_group_quants_dot_separator():
+    files = ["Qwen3-8B.Q4_K_M.gguf", "Qwen3-8B.i1-Q6_K.gguf", "Qwen3-8B-Q8_0.gguf"]
+    assert tool.group_quants(files, "Qwen3-8B") == {
+        "Q4_K_M": ["Qwen3-8B.Q4_K_M.gguf"],
+        "i1-Q6_K": ["Qwen3-8B.i1-Q6_K.gguf"],
+        "Q8_0": ["Qwen3-8B-Q8_0.gguf"],
+    }
+
+
+def test_group_quants_falls_back_to_common_prefix():
+    files = ["Qwen3-8B.i1-IQ1_M.gguf", "Qwen3-8B.i1-Q4_K_M.gguf", "Qwen3-8B.i1-Q6_K.gguf"]
+    assert tool.group_quants(files, "Qwen3-8B-i1") == {
+        "IQ1_M": ["Qwen3-8B.i1-IQ1_M.gguf"],
+        "Q4_K_M": ["Qwen3-8B.i1-Q4_K_M.gguf"],
+        "Q6_K": ["Qwen3-8B.i1-Q6_K.gguf"],
+    }
+
+
+def test_group_quants_single_unrelated_file_keeps_stem():
+    assert tool.group_quants(["weird.gguf"], "Other") == {"weird": ["weird.gguf"]}
+
+
+def test_mmproj_detected_anywhere_in_name():
+    files = ["gemma-3-4b-it-mmproj-f16.gguf", "gemma-3-4b-it-Q4_K_M.gguf"]
+    assert tool.group_quants(files, "gemma-3-4b-it") == {"Q4_K_M": ["gemma-3-4b-it-Q4_K_M.gguf"]}
+    assert tool.find_mmproj(files) == "gemma-3-4b-it-mmproj-f16.gguf"
 
 
 def test_default_ollama_name():
