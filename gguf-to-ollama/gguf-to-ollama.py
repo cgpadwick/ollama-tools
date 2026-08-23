@@ -25,6 +25,7 @@ import argparse
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -319,6 +320,125 @@ def resolve_model_file(paths: list[str], workdir: Path, tool: str | None) -> Pat
     return merge_shards([workdir / p for p in paths], merged, tool)
 
 
+def read_gguf_metadata(path: Path) -> dict | None:
+    """Parse the metadata KV section of a GGUF file (header only, no tensor data).
+
+    Returns None if the file is not a readable GGUF. Array values are skipped
+    (returned as None) except arrays are not needed for anything we look up.
+    """
+    _SCALARS = {
+        0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2), 4: ("<I", 4),
+        5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1), 10: ("<Q", 8), 11: ("<q", 8),
+        12: ("<d", 8),
+    }
+    try:
+        with path.open("rb") as f:
+            def take(n: int) -> bytes:
+                b = f.read(n)
+                if len(b) != n:
+                    raise EOFError
+                return b
+
+            def scalar(t: int):
+                fmt, n = _SCALARS[t]
+                return struct.unpack(fmt, take(n))[0]
+
+            def string() -> str:
+                (n,) = struct.unpack("<Q", take(8))
+                return take(n).decode("utf-8", "replace")
+
+            def value(t: int):
+                if t in _SCALARS:
+                    return scalar(t)
+                if t == 8:
+                    return string()
+                if t == 9:  # array: elem type, count, elems (parsed but unused)
+                    et, n = struct.unpack("<IQ", take(12))
+                    return [value(et) for _ in range(n)]
+                raise ValueError(f"unknown GGUF value type {t}")
+
+            if take(4) != b"GGUF":
+                return None
+            version, _tensors, n_kv = struct.unpack("<IQQ", take(20))
+            if version < 2:  # v1 used 32-bit counts; nobody ships those any more
+                return None
+            meta: dict = {}
+            for _ in range(n_kv):
+                key = string()
+                (t,) = struct.unpack("<I", take(4))
+                meta[key] = value(t)
+            return meta
+    except (OSError, EOFError, ValueError, KeyError, struct.error):
+        return None
+
+
+def native_ctx(meta: dict) -> int | None:
+    arch = meta.get("general.architecture")
+    v = meta.get(f"{arch}.context_length") if arch else None
+    return int(v) if isinstance(v, (int, float)) and v > 0 else None
+
+
+def kv_bytes_per_token(meta: dict) -> int | None:
+    """Approximate KV-cache bytes per token at f16 (Ollama's default cache type)."""
+    arch = meta.get("general.architecture")
+    if not arch:
+        return None
+    layers = meta.get(f"{arch}.block_count")
+    kv_heads = meta.get(f"{arch}.attention.head_count_kv")
+    head_dim = meta.get(f"{arch}.attention.key_length")
+    if head_dim is None:
+        emb = meta.get(f"{arch}.embedding_length")
+        heads = meta.get(f"{arch}.attention.head_count")
+        head_dim = emb // heads if emb and heads else None
+    if not (layers and kv_heads and head_dim):
+        return None
+    return 2 * int(layers) * int(kv_heads) * int(head_dim) * 2  # K+V, f16
+
+
+def available_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # rough fallback: total physical RAM
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def pick_num_ctx(native: int | None, kv_per_token: int | None, avail: int | None, model_bytes: int) -> int | None:
+    """Largest multiple of 4096 whose KV cache fits next to the weights, capped at native."""
+    if native is None:
+        return None
+    if kv_per_token is None or avail is None:
+        return native
+    budget = avail - int(model_bytes * 1.1)  # weights + overhead margin
+    fit = budget // kv_per_token if budget > 0 else 0
+    ctx = min(native, (fit // 4096) * 4096)
+    return max(ctx, 4096)
+
+
+def auto_num_ctx(model: Path) -> int | None:
+    """Pick num_ctx from the model's GGUF header and available memory; None = no opinion."""
+    meta = read_gguf_metadata(model)
+    if meta is None:
+        return None
+    native = native_ctx(meta)
+    kv = kv_bytes_per_token(meta)
+    avail = available_memory_bytes()
+    ctx = pick_num_ctx(native, kv, avail, model.stat().st_size)
+    if ctx is None:
+        return None
+    detail = f"native {native}"
+    if kv is not None and avail is not None:
+        detail += f", KV ~{kv / 2**20:.2f} MiB/token, ~{avail / 2**30:.0f} GiB available"
+    print(f"==> num_ctx {ctx} (auto: {detail}; override with --num-ctx)")
+    return ctx
+
+
 def write_modelfile(
     model: Path, mmproj: Path | None, workdir: Path, *, preset: str, num_ctx: int | None
 ) -> Path:
@@ -366,7 +486,12 @@ def main() -> None:
         choices=sorted(PRESETS),
         help="Modelfile sampling preset (default: qwen3 for Qwen3 repos, else none)",
     )
-    ap.add_argument("--num-ctx", type=int, default=8192, help="PARAMETER num_ctx (default: 8192; 0 to omit)")
+    ap.add_argument(
+        "--num-ctx",
+        type=int,
+        help="PARAMETER num_ctx (default: auto — largest context that fits in memory, "
+        "capped at the model's native length; 0 to omit and use Ollama's default)",
+    )
     ap.add_argument("--gguf-split", help="path to llama-gguf-split (for split builds)")
     ap.add_argument("--no-mmproj", action="store_true", help="skip the vision projector even if the repo has one")
     ap.add_argument("--download-only", action="store_true", help="download/merge but do not import")
@@ -376,7 +501,6 @@ def main() -> None:
     base = repo_base(repo)
     workdir: Path = args.dir or default_workdir(repo)
     preset = args.preset or default_preset(repo)
-    num_ctx = args.num_ctx or None
 
     files, sizes = fetch_repo_ggufs(repo)
     quants = group_quants(files, base)
@@ -435,6 +559,10 @@ def main() -> None:
         if not mmproj.exists():
             die(f"expected {mmproj} after download but it is missing")
 
+    if args.num_ctx is None:
+        num_ctx = auto_num_ctx(model) or 8192
+    else:
+        num_ctx = args.num_ctx or None  # 0 -> omit the PARAMETER entirely
     print(f"==> sampling preset: {preset}" + ("" if args.preset else " (auto; override with --preset)"))
     modelfile = write_modelfile(model, mmproj, workdir, preset=preset, num_ctx=num_ctx)
     if args.download_only:
