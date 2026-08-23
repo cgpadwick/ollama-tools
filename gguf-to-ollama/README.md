@@ -86,6 +86,8 @@ uv run python gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
 uv run python gguf-to-ollama.py --repo bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q6_K
 uv run python gguf-to-ollama.py --repo mradermacher/Qwen3-8B-i1-GGUF                     # no --quant: picks Q4_K_M
 uv run python gguf-to-ollama.py --repo unsloth/gemma-3-27b-it-GGUF --quant Q4_K_M
+
+uv run python gguf-to-ollama.py --quant BF16 --num-ctx 65536 --name qwen3.8-27b:bf16-64k   # long-context import
 ```
 
 Then:
@@ -137,6 +139,11 @@ uv run pytest
   `*Qwen3*` → `qwen3`, embedding/reranker → `none`, anything else → `none`) and printed;
   override with `--preset`, or edit the generated `Modelfile` and re-run `ollama create`.
   `num_ctx 8192` is a memory tradeoff; raise it with `--num-ctx`.
+- **Long context**: pass `--num-ctx 65536` (or whatever the model supports) at import time —
+  no separate Modelfile edit needed. Mind the KV cache: on a 27B model a 64K context adds
+  tens of GB of memory on top of the weights, so a q8_0 or q4 quant leaves far more headroom
+  than BF16. To try several context lengths, re-run with different `--num-ctx`/`--name`
+  values — the GGUFs are reused, only `ollama create` runs again.
 - Merging requires `llama-gguf-split` (see `install-llama-tools.sh`). If the merged file
   already exists, the tool is not needed and the shards are not re-downloaded, so you can
   delete them after a successful merge. The merge writes to a `.part` file and renames it
