@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    defaults:
+      run:
+        working-directory: gguf-to-ollama
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: gguf-to-ollama/uv.lock
+      - run: uv sync --locked --group dev
+      - run: uv run pytest -q
+      - name: --help smoke test (no network)
+        run: uv run python gguf-to-ollama.py --help > /dev/null
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n gguf-to-ollama/install-llama-tools.sh
+      - uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: gguf-to-ollama

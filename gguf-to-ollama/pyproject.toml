@@ -1,7 +1,7 @@
 [project]
-name = "qwen38-27b-ollama"
+name = "gguf-to-ollama"
 version = "0.1.0"
-description = "Download Qwen3.8-27B GGUFs, merge split shards, and import into Ollama"
+description = "Download GGUFs from Hugging Face, merge split shards, and import into Ollama"
 requires-python = ">=3.10"
 dependencies = [
     "huggingface_hub[hf_xet]>=0.34",

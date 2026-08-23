@@ -1,16 +1,31 @@
 # ollama-tools
 
+[![CI](https://github.com/cgpadwick/ollama-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/cgpadwick/ollama-tools/actions/workflows/ci.yml)
+
 Utilities for getting models into [Ollama](https://ollama.com).
 
 ## Tools
 
 | Directory | Description |
 | --- | --- |
-| [`qwen/`](qwen/) | Download Qwen3.8-27B GGUFs from Hugging Face, merge split shards, and import into Ollama |
+| [`gguf-to-ollama/`](gguf-to-ollama/) | Download GGUFs from any Hugging Face repo (unsloth, bartowski, …), merge split shards, and import into Ollama |
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) for Python environments
-- [Ollama](https://ollama.com) on your `PATH`
+- [Ollama](https://ollama.com) on your `PATH` — keep it **up to date**; new model families
+  (and vision projectors via a second `FROM`) need a recent release, otherwise `ollama create`
+  fails with an unsupported-architecture error. See [Updating Ollama](gguf-to-ollama/README.md#updating-ollama).
 
 Each tool directory is a self-contained uv project — see its README for usage.
+
+## Development
+
+CI runs on every pull request: `pytest` on Python 3.10 and 3.13, plus `shellcheck` on the
+installer. Run the same locally:
+
+```bash
+cd gguf-to-ollama
+uv sync --group dev
+uv run pytest
+```
